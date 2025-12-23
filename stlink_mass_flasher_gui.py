@@ -1,5 +1,6 @@
 import os
 import re
+import csv
 import threading
 import queue
 import subprocess
@@ -9,6 +10,9 @@ from tkinter import ttk, filedialog, messagebox
 # 如果你的 CLI 不在 PATH，把它改成绝对路径，例如：
 # CLI_EXE_DEFAULT = r"C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe"
 CLI_EXE_DEFAULT = "STM32_Programmer_CLI.exe"
+
+# STM32F401RE（STM32F4）UID(96-bit) 基地址：0x1FFF7A10，长度 12 字节（3 x 32-bit）
+UID_BASE_ADDR = 0x1FFF7A10
 
 def run_cli(args, timeout=None):
     cmd = [CLI_EXE_DEFAULT] + args
@@ -27,7 +31,6 @@ def run_cli(args, timeout=None):
 def parse_stlink_list(text):
     lines = text.splitlines()
 
-    # ST-LINK probes
     probes = []
     current = None
     probe_re = re.compile(r"^\s*ST-Link Probe\s+(\d+)\s*:", re.IGNORECASE)
@@ -92,11 +95,133 @@ def normalize_hex_addr(s):
         return s
     return s
 
+def _addr_str(x: int) -> str:
+    return f"{x:08X}"
+
+def parse_uid_from_read_output(out_text: str):
+    """
+    解析 STM32F401RE UID（96-bit），兼容 STM32CubeProgrammer CLI v2.19.0 的输出：
+      0x1FFF7A10 : 0039001E 35315107 38333932
+
+    返回 24 hex（大写）或 None。
+    """
+
+    # 1) 最可靠：直接匹配 “0x1FFF7A10 : <w0> <w1> <w2>”
+    m = re.search(
+        r"\b(?:0x)?1FFF7A10\b\s*:\s*([0-9A-Fa-f]{8})\s+([0-9A-Fa-f]{8})\s+([0-9A-Fa-f]{8})",
+        out_text
+    )
+    if m:
+        return (m.group(1) + m.group(2) + m.group(3)).upper()
+
+    # 2) 次可靠：找到 token 1FFF7A10 后面紧跟的三个 8-hex
+    toks = re.findall(r"\b(?:0x)?([0-9A-Fa-f]{8})\b", out_text)
+    toks_u = [t.upper() for t in toks]
+    base = "1FFF7A10"
+    addr_tokens = {base, "1FFF7A14", "1FFF7A18", "1FFF7A1C"}
+
+    if base in toks_u:
+        i = toks_u.index(base) + 1
+        words = []
+        while i < len(toks_u) and len(words) < 3:
+            t = toks_u[i]
+            if t not in addr_tokens and re.fullmatch(r"[0-9A-F]{8}", t):
+                words.append(t)
+            i += 1
+        if len(words) == 3:
+            return (words[0] + words[1] + words[2]).upper()
+
+    # 3) 兜底：过滤掉地址 token 后，取前三个 8-hex
+    vals = [t for t in toks_u if t not in addr_tokens and re.fullmatch(r"[0-9A-F]{8}", t)]
+    if len(vals) >= 3:
+        return (vals[0] + vals[1] + vals[2]).upper()
+
+    return None
+def read_mcu_uid_via_stlink(sn):
+    """
+    读取 MCU UID（96-bit），返回 (uid_or_None, raw_output, rc)
+    兼容不同版本 CLI 对 -r32 第二参数（可能是“数量”或“字节数”）差异：
+      - 先尝试 3（3个32-bit word）
+      - 再尝试 12 / 0xC（12字节）
+    """
+    base = ["-c", "port=SWD", f"sn={sn}", "mode=UR", "reset=HWrst"]
+    addr = f"0x{UID_BASE_ADDR:08X}"
+
+    attempts = [
+        ["-r32", addr, "3"],
+        ["-r32", addr, "12"],
+        ["-r32", addr, "0xC"],
+    ]
+
+    last_rc, last_out = 1, ""
+    for a in attempts:
+        args = base + a
+        rc, out = run_cli(args)
+        uid = parse_uid_from_read_output(out)
+        if uid:
+            return uid, out, rc
+        last_rc, last_out = rc, out
+
+    return None, last_out, last_rc
+
+class UidSnTable:
+    """
+    只维护一个表：uid_sn.csv
+      - 两列：uid_96bit_hex, stlink_sn
+      - dict(uid->sn) 做 O(1) 查找
+      - 重复 UID 覆盖为最新，并重写整个文件保证文件内无重复
+    重要：程序启动时就会创建文件（至少带表头），避免“没有写入就没有文件”的困惑。
+    """
+    def __init__(self, csv_path: str):
+        self.csv_path = csv_path
+        self.data = {}  # uid -> sn
+        self._load()
+        self._ensure_file_exists()
+
+    def _ensure_file_exists(self):
+        os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
+        if not os.path.exists(self.csv_path):
+            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["uid_96bit_hex", "stlink_sn"])
+
+    def _load(self):
+        if not os.path.exists(self.csv_path):
+            return
+        try:
+            with open(self.csv_path, "r", newline="", encoding="utf-8") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    uid = (row.get("uid_96bit_hex") or "").strip().upper()
+                    sn = (row.get("stlink_sn") or "").strip()
+                    if uid and sn:
+                        self.data[uid] = sn
+        except Exception:
+            self.data = {}
+
+    def upsert(self, uid: str, sn: str) -> bool:
+        uid = (uid or "").strip().upper()
+        sn = (sn or "").strip()
+        if not uid or not sn:
+            return False
+        existed = uid in self.data
+        self.data[uid] = sn
+        self._rewrite()
+        return existed
+
+    def _rewrite(self):
+        self._ensure_file_exists()
+        with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["uid_96bit_hex", "stlink_sn"])
+            for uid, sn in self.data.items():
+                w.writerow([uid, sn])
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("ST-LINK 批量烧录工具 (STM32CubeProgrammer CLI)")
-        self.geometry("1020x680")
+        self.title("ST-LINK 批量烧录工具 + UID/SN 表 (STM32F401RE)")
+        self.geometry("1060x720")
         self.minsize(980, 620)
 
         self.devices = []
@@ -108,19 +233,24 @@ class App(tk.Tk):
         self.addr_var = tk.StringVar(value="0x08000000")
         self.verify_var = tk.BooleanVar(value=True)
         self.reset_var = tk.BooleanVar(value=True)
+        self.record_uid_var = tk.BooleanVar(value=True)
+
         self.count_var = tk.StringVar(value="设备数：0")
         self.hint_var = tk.StringVar(value="提示：先在下方列表选中设备（可 Ctrl/Shift 多选），再点“一键烧录/下载”。")
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        log_dir = os.path.join(script_dir, "flash_logs")
+        self.table_path = os.path.join(log_dir, "uid_sn.csv")
+        self.uid_table = UidSnTable(self.table_path)
 
         self._build_ui()
         self._poll_log_queue()
         self.refresh_devices()
 
     def _build_ui(self):
-        # Top controls (use grid so buttons won't disappear when window is narrow)
         top = ttk.Frame(self, padding=8)
         top.pack(side=tk.TOP, fill=tk.X)
 
-        # Row 0
         ttk.Button(top, text="刷新设备", command=self.refresh_devices).grid(row=0, column=0, padx=4, pady=2, sticky="w")
         ttk.Button(top, text="全选", command=self.select_all).grid(row=0, column=1, padx=4, pady=2, sticky="w")
         ttk.Button(top, text="取消全选", command=self.select_none).grid(row=0, column=2, padx=4, pady=2, sticky="w")
@@ -129,13 +259,12 @@ class App(tk.Tk):
 
         ttk.Checkbutton(top, text="校验 Verify", variable=self.verify_var).grid(row=0, column=4, padx=10, pady=2, sticky="w")
         ttk.Checkbutton(top, text="烧录后复位 Reset", variable=self.reset_var).grid(row=0, column=5, padx=10, pady=2, sticky="w")
+        ttk.Checkbutton(top, text="记录 UID->SN", variable=self.record_uid_var).grid(row=0, column=6, padx=10, pady=2, sticky="w")
 
-        # Row 1
         ttk.Label(top, text="固件文件:").grid(row=1, column=0, padx=4, pady=2, sticky="w")
-        ttk.Entry(top, textvariable=self.fw_path_var, width=68).grid(row=1, column=1, columnspan=4, padx=4, pady=2, sticky="we")
-        ttk.Button(top, text="选择 HEX/BIN...", command=self.browse_firmware).grid(row=1, column=5, padx=4, pady=2, sticky="e")
+        ttk.Entry(top, textvariable=self.fw_path_var, width=72).grid(row=1, column=1, columnspan=5, padx=4, pady=2, sticky="we")
+        ttk.Button(top, text="选择 HEX/BIN...", command=self.browse_firmware).grid(row=1, column=6, padx=4, pady=2, sticky="e")
 
-        # Row 2
         ttk.Label(top, text="BIN 地址(HEX忽略):").grid(row=2, column=0, padx=4, pady=2, sticky="w")
         ttk.Entry(top, textvariable=self.addr_var, width=16).grid(row=2, column=1, padx=4, pady=2, sticky="w")
 
@@ -145,13 +274,11 @@ class App(tk.Tk):
         self.stop_btn = ttk.Button(top, text="停止", command=self.stop_flashing, state=tk.DISABLED)
         self.stop_btn.grid(row=2, column=3, padx=4, pady=2, sticky="w")
 
-        ttk.Label(top, textvariable=self.hint_var).grid(row=3, column=0, columnspan=6, padx=4, pady=(6,2), sticky="w")
+        ttk.Label(top, textvariable=self.hint_var).grid(row=3, column=0, columnspan=7, padx=4, pady=(6,2), sticky="w")
 
-        # allow expanding the firmware entry
         top.grid_columnconfigure(2, weight=1)
         top.grid_columnconfigure(3, weight=1)
 
-        # Middle: device list
         mid = ttk.Frame(self, padding=(8,0,8,8))
         mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -165,7 +292,7 @@ class App(tk.Tk):
 
         self.tree.column("idx", width=40, anchor="center")
         self.tree.column("com", width=90, anchor="center")
-        self.tree.column("sn", width=320, anchor="w")
+        self.tree.column("sn", width=340, anchor="w")
         self.tree.column("fw", width=120, anchor="center")
         self.tree.column("ap", width=70, anchor="center")
 
@@ -175,17 +302,18 @@ class App(tk.Tk):
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Bottom: log output
         bot = ttk.Frame(self, padding=(8,0,8,8))
         bot.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
 
         ttk.Label(bot, text="日志:").pack(side=tk.TOP, anchor="w")
-        self.log_text = tk.Text(bot, height=14, wrap="none")
+        self.log_text = tk.Text(bot, height=15, wrap="none")
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         log_vsb = ttk.Scrollbar(bot, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_vsb.set)
         log_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.log(f"[UID/SN 表] {self.table_path}（启动时就会创建文件；重复UID会覆盖为最新）")
 
     def log(self, msg):
         self.log_queue.put(msg)
@@ -297,12 +425,12 @@ class App(tk.Tk):
 
         self.worker_thread = threading.Thread(
             target=self._flash_worker,
-            args=(selected_devs, fw, addr, self.verify_var.get(), self.reset_var.get()),
+            args=(selected_devs, fw, addr, self.verify_var.get(), self.reset_var.get(), self.record_uid_var.get()),
             daemon=True
         )
         self.worker_thread.start()
 
-    def _flash_worker(self, devs, fw, addr, verify, do_reset):
+    def _flash_worker(self, devs, fw, addr, verify, do_reset, record_uid):
         total = len(devs)
         ok = 0
         fail = 0
@@ -314,6 +442,7 @@ class App(tk.Tk):
             self.log("[说明] HEX 自带地址，界面地址框将被忽略。")
         else:
             self.log(f"[地址] {addr}")
+        self.log(f"[UID->SN] {'开启' if record_uid else '关闭'}  (UID_BASE=0x{UID_BASE_ADDR:08X})")
         self.log("========================================")
 
         for i, d in enumerate(devs, start=1):
@@ -340,6 +469,7 @@ class App(tk.Tk):
 
             args = base + w_args + extra
 
+            # 1) flash
             try:
                 rc, out = run_cli(args)
             except Exception as e:
@@ -348,15 +478,31 @@ class App(tk.Tk):
 
             self.log(out.rstrip())
 
-            if rc == 0:
+            flash_ok = (rc == 0)
+            if flash_ok:
                 ok += 1
                 self.log(f"[结果] OK   (OK={ok} / FAIL={fail})")
             else:
                 fail += 1
                 self.log(f"[结果] FAIL rc={rc} (OK={ok} / FAIL={fail})")
 
+            # 2) read uid + update table
+            if record_uid:
+                uid_val, uid_out, uid_rc = read_mcu_uid_via_stlink(sn)
+                if uid_val:
+                    existed = self.uid_table.upsert(uid_val, sn)
+                    if existed:
+                        self.log(f"[UID] {uid_val}  (重复UID：已覆盖为最新 SN={sn})")
+                    else:
+                        self.log(f"[UID] {uid_val}  (已写入表)")
+                else:
+                    self.log("[UID] 读取失败（请看下面输出）")
+                    self.log(uid_out.rstrip())
+                    self.log(f"[UID] read_rc={uid_rc}")
+
         self.log("\n========================================")
         self.log(f"[完成] OK={ok} FAIL={fail}")
+        self.log(f"[输出] UID/SN 表：{self.table_path}")
         self.log("========================================")
         self.after(0, self._flash_done_ui)
 
