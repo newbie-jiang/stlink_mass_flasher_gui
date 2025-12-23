@@ -49,5 +49,5 @@
   STM32_Programmer_CLI.exe -l
   建议使用 带外接电源的 USB Hub（量产连接多块板时更稳定）。
 
-![image-20251224012109532](https://cloud.rocketpi.club/cloud/image-20251224012109532.png)
+![image-20251224013737200](https://cloud.rocketpi.club/cloud/image-20251224013737200.png)
 
