@@ -15,8 +15,8 @@ CLI_EXE_DEFAULT = "STM32_Programmer_CLI.exe"
 # STM32F401RE（STM32F4）UID(96-bit) 基地址：0x1FFF7A10，长度 12 字节（3 x 32-bit）
 UID_BASE_ADDR = 0x1FFF7A10
 
-# 并发可选项
-CONCURRENCY_OPTIONS = (1, 2, 4, 6, 8)
+# 并发可选项（最高 20 线）
+CONCURRENCY_OPTIONS = (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20)
 
 def run_cli(args, timeout=None):
     cmd = [CLI_EXE_DEFAULT] + args
